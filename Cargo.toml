@@ -1,0 +1,18 @@
+[package]
+name = "HeroLink-Mock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pour l'asynchronisme et les timers
+tokio = { version = "1", features = ["full"] }
+
+# Pour la communication série
+tokio-serial = "5.4.4"
+
+# Pour créer le port virtuel (PTY) sur Linux/Fedora
+nix = { version = "0.27", features = ["fs", "term", "process"] }
+
+rand = "0.8"
+# Optionnel : pour manipuler les octets (HEX) des lasers plus facilement
+bytes = "1.5"
