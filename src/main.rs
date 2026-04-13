@@ -1,94 +1,127 @@
 use nix::fcntl::OFlag;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt};
 use rand::Rng;
-use std::fs::remove_file;
+use std::fs::{self, remove_file};
 use std::os::unix::fs::symlink;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::Path;
-use std::time::Duration;
-use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+use tokio::fs::File;
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+
+struct SerialMock {
+    name: String,
+    // On utilise Arc<Mutex<File>> pour pouvoir cloner l'accès au port
+}
+
+impl SerialMock {
+    fn new(path: &str, label: &str) -> Self {
+        let master_fd = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK).unwrap();
+        grantpt(&master_fd).unwrap();
+        unlockpt(&master_fd).unwrap();
+
+        let slave_name = unsafe { ptsname(&master_fd) }.unwrap();
+        let link_path = format!("/tmp/{}", path);
+
+        if Path::new(&link_path).exists() {
+            let _ = remove_file(&link_path);
+        }
+        symlink(&slave_name, &link_path).unwrap();
+
+        println!("{} prêt sur : {}", label, link_path);
+
+        let raw_fd = master_fd.into_raw_fd();
+        let std_file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+        let tokio_file = File::from_std(std_file);
+
+        Self {
+            name: label.to_string(),
+            file: Arc::new(Mutex::new(tokio_file)),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let master_fd = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK)?;
-    grantpt(&master_fd)?;
-    unlockpt(&master_fd)?;
+    let scale = SerialMock::new("ttyPackageHero", "BALANCE");
+    let laser_l = SerialMock::new("ttyLaserL", "LASER L");
+    let laser_w = SerialMock::new("ttyLaserW", "LASER W");
+    let laser_h = SerialMock::new("ttyLaserH", "LASER H");
 
-    let slave_name = unsafe { ptsname(&master_fd) }?;
-    let link_path = "/tmp/ttyPackageHero";
-
-    if Path::new(link_path).exists() {
-        remove_file(link_path)?;
-    }
-    symlink(&slave_name, link_path)?;
-
-    println!("PackageHERO Simulator ready on: {}", link_path);
-    println!("Press ENTER to send weight (Scale)");
-    println!("Press 'L' then ENTER for measurement (Laser)");
-
-    let raw_fd = master_fd.into_raw_fd();
-    let std_file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
-    let mut tokio_file = io::BufStream::new(tokio::fs::File::from_std(std_file));
-
-    let mut reader_stdin = BufReader::new(io::stdin()).lines();
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let _ = tokio_file.write_all(b"AF01\r\n").await;
-    let _ = tokio_file.write_all(&[0x00, 0x00, 0x0D, 0x0A]).await;
-    let _ = tokio_file.flush().await;
-
-    let mut buffer = [0; 1024];
+    let mut buffer_scale = [0; 1024];
+    let mut buffer_l = [0; 1024];
+    let mut buffer_w = [0; 1024];
+    let mut buffer_h = [0; 1024];
 
     loop {
+        let scale_file = scale.file.clone();
+        let l_file = laser_l.file.clone();
+        let w_file = laser_w.file.clone();
+        let h_file = laser_h.file.clone();
+
         tokio::select! {
-                    line_result = reader_stdin.next_line() => {
-                        if let Ok(Some(input)) = line_result {
-                            match input.to_uppercase().as_str() {
-                                "L" => {
-                                    let dist: u16 = rand::thread_rng().gen_range(500..2000);
-                                    let hi = (dist >> 8) as u8;
-                                    let lo = (dist & 0xFF) as u8;
-                                    let resp = vec![0xAA, 0x00, 0x00, 0x22, 0x00, hi, lo, 0x00, 0x80, 0x0D, 0x0A];
+            res = async { scale_file.lock().await.read(&mut buffer_scale).await } => {
+                if let Ok(n) = res {
+                    if n > 0 {
+                        let received = &buffer_scale[..n];
+                        if received.contains(&0xBB) {
+                            println!("Balance : Commande reçue. Envoi ACK (0xAF01)");
 
-                                    println!("Laser: Sending distance {}mm", dist);
-                                    let _ = tokio_file.write_all(&resp).await;
-                                    let _ = tokio_file.flush().await;
-                                    println!("Laser sent.");                        }
-                                _ => {
-                                    let poids = rand::thread_rng().gen_range(100..5000);
-                                    let reponse = format!("A00A{:010}\r\n", poids);
-                                    println!("Scale: Sending weight {}g", poids);
-                                    let _ = tokio_file.write_all(reponse.as_bytes()).await;
-                                    let _ = tokio_file.flush().await;
-                                    println!("Weight sent.");
-                                }
-                            }
-                        }
-                    }
+                            let mut f = scale_file.lock().await;
+                            f.write_all(&[0xAF, 0x01]).await?;
+                            f.flush().await?;
+                            drop(f);
 
-                    result = tokio_file.read(&mut buffer) => {
-                        let n = match result {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
-                        if n == 0 { continue; }
-                        let received = &buffer[..n];
+                            let file_ptr = scale_file.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                                let poids = rand::thread_rng().gen_range(500..3500);
 
-                        if received.starts_with(&[0xAA]) {
-                            let ack_laser = vec![0xAA, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1, 0x0D, 0x0A];
-                            let _ = tokio_file.write_all(&ack_laser).await;
-                            let _ = tokio_file.flush().await;
-                        } else {
-                            let cmd = String::from_utf8_lossy(received).trim().to_string();
-                            match cmd.as_str() {
-                                "BB100000" => { let _ = tokio_file.write_all(b"AF01\r\n").await; }
-                                "BB010000" => { let _ = tokio_file.write_all(format!("A00A{:010}\r\n", 1250).as_bytes()).await; }
-                                "BB040000" => { let _ = tokio_file.write_all(b"AD12AD22AD32AD42\r\n").await; }
-                                _ => {}
-                            }
-                            let _ = tokio_file.flush().await;
+                                // Format trame balance : A0 0A + Poids ASCII
+                                let resp_str = format!("A00A       {}", poids);
+                                let mut f = file_ptr.lock().await;
+                                let _ = f.write_all(resp_str.as_bytes()).await;
+                                let _ = f.write_all(b"\r\n").await;
+                                let _ = f.flush().await;
+                                println!("Balance : Poids envoyé -> {}g", poids);
+                            });
                         }
                     }
                 }
+            }
+
+            res = async { l_file.lock().await.read(&mut buffer_l).await } => {
+                handle_laser(&laser_l.name, l_file, res, &buffer_l).await?;
+            }
+            res = async { w_file.lock().await.read(&mut buffer_w).await } => {
+                handle_laser(&laser_w.name, w_file, res, &buffer_w).await?;
+            }
+            res = async { h_file.lock().await.read(&mut buffer_h).await } => {
+                handle_laser(&laser_h.name, h_file, res, &buffer_h).await?;
+            }
+        }
     }
+}
+
+async fn handle_laser(name: &str, file: Arc<Mutex<File>>, res: io::Result<usize>, buffer: &[u8]) -> io::Result<()> {
+    if let Ok(n) = res {
+        if n > 0 {
+            let received = &buffer[..n];
+            if received.iter().any(|&b| b == 0x20) {
+                let dist: u32 = rand::thread_rng().gen_range(200..1000);
+
+                // Trame de réponse binaire (14 octets typique)
+                let mut resp = vec![0xAA, 0x00, 0x00, 0x22, 0x00, 0x03];
+                resp.extend_from_slice(&dist.to_be_bytes()); // Distance 4 octets
+                resp.extend_from_slice(&[0x00, 0x30, 0xEE, 0x0D, 0x0A]); // Qualité + Checksum + Fin
+
+                let mut f = file.lock().await;
+                f.write_all(&resp).await?;
+                f.flush().await?;
+                println!("{}: {}mm envoyé", name, dist);
+            }
+        }
+    }
+    Ok(())
 }
